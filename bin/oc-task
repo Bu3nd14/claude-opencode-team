@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# oc-task — ponte beads (bd) <-> agenti opencode, valido per qualsiasi progetto.
+#
+#   oc-task init                          attiva beads nel progetto corrente (stealth, idempotente)
+#   oc-task new  "titolo" [opzioni]       crea un bead e lo delega subito
+#   oc-task run  <id> [opzioni]           delega un bead esistente a un agente opencode
+#   oc-task followup <id> "messaggio"     continua la stessa sessione opencode del bead
+#   oc-task status                        bead delegati (opencode e Claude) ancora aperti
+#   oc-task claim  <id> --as claude:NOME  prende in carico un bead per un sottoagente Claude Code
+#   oc-task report <id> --as claude:NOME [-f FILE]
+#                                         salva la risposta (FILE o stdin) e restituisce il bead per la verifica
+#
+# Opzioni (new/run):
+#   -a, --agent NOME     agente opencode (default: label "agent:NOME" del bead, altrimenti default di opencode)
+#   -m, --model P/M      modello opencode (provider/model#variant)
+#   -d, --desc TESTO     descrizione (solo new)
+#   -t, --type TIPO      task|bug|feature|chore|epic (solo new, default task)
+#   -p, --prio N         0..4 (solo new, default 2)
+#   -C, --dir PATH       directory in cui far lavorare opencode (es. un git worktree); bd resta nel progetto
+#       --auto           auto-approva i permessi opencode non esplicitamente negati
+#       --force-team     agisce anche su un bead team:oc (solo su richiesta esplicita dell'utente)
+#
+# new etichetta i bead con team:misto; run/claim/followup rifiutano i bead team:oc (anche via epic padre).
+#
+# Output: un oggetto JSON su stdout {id, agent, session, exit, cost, response}.
+# Durante il run il bead è assegnato a "opencode:<agente>" (o "claude:<agente>" con claim/report).
+# A fine run torna a chi ha delegato (in_progress, label agent-review) con la risposta come commento: si verifica e si chiude con
+# `bd close <id>` (o si rilancia con followup). In caso di errore torna "open" e non assegnato.
+set -euo pipefail
+
+die() { echo "oc-task: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "manca '$1' nel PATH"; }
+need bd; need opencode; need jq
+
+# oc-task è lo strumento con cui Claude Code delega a opencode: dentro opencode non va usato
+# (i suoi agenti si delegano col proprio task tool). opencode esporta OPENCODE=1 nei comandi.
+if [[ ${OPENCODE:-} == 1 && ${OC_TASK_ALLOW_INSIDE_OPENCODE:-} != 1 ]]; then
+  die "sei dentro opencode: oc-task è riservato a Claude Code. Delega ai tuoi sottoagenti con il tuo strumento task; per bd usa i comandi bd con --actor opencode:<agente>"
+fi
+
+MAX_COMMENT=${OC_TASK_MAX_COMMENT:-12000}
+DELEGATOR=${BEADS_ACTOR:-$(git config user.name 2>/dev/null || echo "${USER:-me}")}
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+ensure_beads() {
+  bd where >/dev/null 2>&1 || die "nessun workspace beads qui: lancia 'oc-task init' nella root del progetto"
+}
+
+bead_json() { bd show "$1" --json 2>/dev/null | jq -e '.[0]' || die "bead '$1' non trovato"; }
+
+claim_as() { # $1=id $2=actor — prende in carico (toglie l'eventuale label di revisione precedente)
+  bd update "$1" --remove-label agent-review --remove-label opencode-review >/dev/null 2>&1 || true
+  bd update "$1" --claim --actor "$2" --json >/dev/null 2>&1 || true
+}
+
+hand_back() { # $1=id $2=actor — restituisce il bead a chi ha delegato, in attesa di verifica
+  bd update "$1" --actor "$2" --assignee "$DELEGATOR" --add-label agent-review >/dev/null 2>&1 || true
+}
+
+build_prompt() { # $1=bead json  $2=id
+  local title desc
+  title=$(jq -r '.title' <<<"$1")
+  desc=$(jq -r '.description // ""' <<<"$1")
+  cat <<EOF
+[beads ${2}] ${title}
+
+${desc}
+
+---
+Lavori sul bead ${2} (traccia con: bd show ${2}). Se scopri lavoro extra, crealo con
+\`bd create "..." --deps discovered-from:${2}\` invece di allargare questo task.
+Non chiudere tu il bead: lo chiude chi ha delegato dopo la verifica.
+Chiudi la risposta con queste righe:
+ESITO: FATTO | PARZIALE | BLOCCATO
+FILE: <file modificati, o "nessuno">
+VERIFICHE: <comandi/test eseguiti e risultato>
+EOF
+}
+
+# Esegue opencode e stampa il JSON riassuntivo. $1=id $2=agent $3=session(opz) $4=prompt; resto=flag opencode
+dispatch() {
+  local id=$1 agent=$2 session=$3 prompt=$4; shift 4
+  local title out err rc=0 actor
+  actor="opencode:${agent:-default}"
+  title=$(jq -r '.title' <<<"$(bead_json "$id")")
+  out=$(mktemp -t oc-task.out); err=$(mktemp -t oc-task.err)
+  trap 'rm -f "$out" "$err"' RETURN
+
+  local args=(run --format json --title "${id}: ${title}")
+  [[ -n $agent ]] && args+=(--agent "$agent")
+  [[ -n $session ]] && args+=(--session "$session")
+  args+=("$@" "$prompt")
+
+  claim_as "$id" "$actor"
+  ( cd "$WORKDIR" && opencode "${args[@]}" ) >"$out" 2>"$err" || rc=$?
+
+  local sid response cost
+  sid=$(jq -rs 'map(.sessionID // empty) | first // ""' "$out" 2>/dev/null || echo "")
+  response=$(jq -rs '[.[] | select(.type=="text") | .part.text] | join("\n\n")' "$out" 2>/dev/null || echo "")
+  cost=$(jq -rs '[.[] | select(.type=="step_finish") | .part.cost // 0] | add // 0' "$out" 2>/dev/null || echo 0)
+  if [[ $rc -ne 0 || -z $response ]]; then
+    [[ $rc -eq 0 ]] && rc=2
+    local emsg
+    emsg=$(jq -rs '[.[] | select(.type=="error") | .error.message // (.error|tostring)] | join("; ")' "$out" 2>/dev/null || true)
+    response="ERRORE opencode (exit $rc): ${emsg:-$(tail -c 2000 "$err")}"
+  fi
+
+  local comment="opencode ${actor#opencode:} · session ${sid:-?} · \$${cost}
+${response}"
+  bd comment "$id" "${comment:0:$MAX_COMMENT}" --actor "$actor" >/dev/null 2>&1 || true
+  bd update "$id" --actor "$actor" --json --metadata "$(jq -nc \
+      --arg s "$sid" --arg a "${agent:-default}" --arg d "$WORKDIR" \
+      '{opencode_session:$s, opencode_agent:$a, opencode_dir:$d, last_agent:("opencode:"+$a)}')" >/dev/null 2>&1 || true
+  if [[ $rc -ne 0 ]]; then
+    bd update "$id" --status open --actor "$actor" >/dev/null 2>&1 || true
+    bd unclaim "$id" --actor "$actor" >/dev/null 2>&1 || true
+  else
+    hand_back "$id" "$actor"
+  fi
+
+  jq -n --arg id "$id" --arg agent "${agent:-default}" --arg session "$sid" \
+        --argjson exit "$rc" --argjson cost "${cost:-0}" --arg response "$response" \
+        '{id:$id, agent:$agent, session:$session, exit:$exit, cost:$cost, response:$response}'
+  return "$rc"
+}
+
+cmd=${1:-}; [[ -z $cmd || $cmd == -h || $cmd == --help ]] && usage
+shift
+
+AGENT="" MODEL="" DESC="" TYPE="task" PRIO="2" WORKDIR="$PWD" OCFLAGS=() AS="" FILE="" FORCE_TEAM=0
+POS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -a|--agent) AGENT=$2; shift 2;;
+    -m|--model) MODEL=$2; shift 2;;
+    -d|--desc)  DESC=$2; shift 2;;
+    -t|--type)  TYPE=$2; shift 2;;
+    -p|--prio)  PRIO=$2; shift 2;;
+    -C|--dir)   WORKDIR=$(cd "$2" && pwd); shift 2;;
+    --auto)     OCFLAGS+=(--auto); shift;;
+    --as)       AS=$2; shift 2;;
+    -f|--file)  FILE=$2; shift 2;;
+    --force-team) FORCE_TEAM=1; shift;;
+    -h|--help)  usage;;
+    *)          POS+=("$1"); shift;;
+  esac
+done
+[[ -n $MODEL ]] && OCFLAGS+=(--model "$MODEL")
+
+team_of() { # label team:* del bead, altrimenti del suo epic padre
+  local b=$1 t parent
+  t=$(jq -r '(.labels // [])[] | select(startswith("team:"))' <<<"$b" | head -1)
+  if [[ -z $t ]]; then
+    parent=$(jq -r '(.dependencies // [])[] | select(.dependency_type=="parent-child") | .id' <<<"$b" | head -1)
+    [[ -n $parent ]] && t=$(bd show "$parent" --json 2>/dev/null | jq -r '.[0].labels // [] | .[] | select(startswith("team:"))' | head -1)
+  fi
+  echo "$t"
+}
+
+team_guard() { # rifiuta di toccare un bead guidato dal solo opencode
+  local t; t=$(team_of "$1")
+  if [[ $t == team:oc && $FORCE_TEAM -eq 0 ]]; then
+    die "$2 è team:oc (lo guida opencode da solo). Per entrarci: chiedi all'utente, cambia la label in team:misto, oppure --force-team"
+  fi
+}
+
+agent_for() { # agente esplicito, altrimenti label agent:NOME, altrimenti vuoto
+  [[ -n $AGENT ]] && { echo "$AGENT"; return; }
+  jq -r '(.labels // [])[] | select(startswith("agent:") and (startswith("agent:claude-") | not))
+         | sub("^agent:";"")' <<<"$1" | head -1
+}
+
+case $cmd in
+  init)
+    if bd where >/dev/null 2>&1; then echo "beads già attivo: $(bd where 2>/dev/null | head -1)"; exit 0; fi
+    git rev-parse --show-toplevel >/dev/null 2>&1 || die "non sei in un repo git"
+    cd "$(git rev-parse --show-toplevel)"
+    prefix=${POS[0]:-$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')}
+    bd init --stealth --non-interactive -q -p "$prefix"
+    bd config set export.auto true >/dev/null 2>&1 || true   # .beads/issues.jsonl per bv (beads_viewer)
+    echo "beads attivo in $PWD (prefisso $prefix, stealth: nessun file tracciato da git; vista: bv)"
+    ;;
+  new)
+    ensure_beads
+    [[ ${#POS[@]} -ge 1 ]] || die "uso: oc-task new \"titolo\" [-a agente] [-d descrizione]"
+    newargs=("${POS[0]}" -t "$TYPE" -p "$PRIO")
+    [[ -n $DESC ]] && newargs+=(-d "$DESC")
+    labels="team:misto"; [[ -n $AGENT ]] && labels+=",agent:$AGENT"
+    newargs+=(-l "$labels")
+    id=$(bd create "${newargs[@]}" --silent)
+    [[ -n $id ]] || die "creazione bead fallita"
+    echo "oc-task: creato $id" >&2
+    b=$(bead_json "$id")
+    dispatch "$id" "$(agent_for "$b")" "" "$(build_prompt "$b" "$id")" ${OCFLAGS[@]+"${OCFLAGS[@]}"}
+    ;;
+  run)
+    ensure_beads
+    [[ ${#POS[@]} -ge 1 ]] || die "uso: oc-task run <id> [-a agente]"
+    id=${POS[0]}; b=$(bead_json "$id"); team_guard "$b" "$id"
+    dispatch "$id" "$(agent_for "$b")" "" "$(build_prompt "$b" "$id")" ${OCFLAGS[@]+"${OCFLAGS[@]}"}
+    ;;
+  followup)
+    ensure_beads
+    [[ ${#POS[@]} -ge 2 ]] || die "uso: oc-task followup <id> \"messaggio\""
+    id=${POS[0]}; b=$(bead_json "$id"); team_guard "$b" "$id"
+    sid=$(jq -r '.metadata.opencode_session // ""' <<<"$b")
+    [[ -n $sid ]] || die "$id non ha ancora una sessione opencode: usa 'oc-task run'"
+    agent=${AGENT:-$(jq -r '.metadata.opencode_agent // ""' <<<"$b")}; [[ $agent == default ]] && agent=""
+    d=$(jq -r '.metadata.opencode_dir // ""' <<<"$b"); [[ -n $d && -d $d && $WORKDIR == "$PWD" ]] && WORKDIR=$d
+    dispatch "$id" "$agent" "$sid" "${POS[1]}" ${OCFLAGS[@]+"${OCFLAGS[@]}"}
+    ;;
+  status)
+    ensure_beads
+    # in corso presso un agente (opencode:* / claude:*), oppure terminati e in attesa di verifica
+    bd list --json 2>/dev/null | jq -r '.[] | select(.status != "closed")
+      | (.assignee // "") as $a | (.labels // []) as $l
+      | select(($a | test("^(opencode|claude):")) or ($l | index("agent-review")) or ($l | index("opencode-review")))
+      | [.id, (if ($a | test("^(opencode|claude):")) then "running" else "review" end),
+         (if ($a | test("^(opencode|claude):")) then $a else (.metadata.last_agent // "-") end),
+         ([$l[] | select(startswith("team:"))] | first // "-"),
+         (.metadata.opencode_session // "-"), .title] | @tsv'
+    ;;
+  claim|report)
+    ensure_beads
+    [[ ${#POS[@]} -ge 1 && -n $AS ]] || die "uso: oc-task $cmd <id> --as claude:NOME"
+    [[ $AS == claude:* ]] || die "--as deve essere claude:<agente> (per opencode usa run/new)"
+    id=${POS[0]}; b=$(bead_json "$id")
+    if [[ $cmd == claim ]]; then
+      team_guard "$b" "$id"
+      claim_as "$id" "$AS"
+      bd update "$id" --actor "$AS" --metadata "$(jq -nc --arg a "$AS" '{last_agent:$a}')" >/dev/null 2>&1 || true
+      echo "oc-task: $id preso in carico da $AS" >&2
+    else
+      if [[ -n $FILE ]]; then text=$(cat "$FILE"); else text=$(cat); fi
+      [[ -n $text ]] || die "risposta vuota: passa -f FILE o il testo su stdin"
+      bd comment "$id" "${AS#claude:} (Claude Code)
+${text:0:$MAX_COMMENT}" --actor "$AS" >/dev/null 2>&1 || die "commento non salvato su $id"
+      hand_back "$id" "$AS"
+      echo "oc-task: risposta di $AS salvata su $id; bead restituito a $DELEGATOR (agent-review)" >&2
+    fi
+    ;;
+  *) usage 1;;
+esac

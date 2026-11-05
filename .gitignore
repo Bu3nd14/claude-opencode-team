@@ -1,0 +1,6 @@
+.DS_Store
+*.bak-*
+# credenziali/stato locale di opencode: mai nel repo
+auth.json
+service.json
+node_modules/

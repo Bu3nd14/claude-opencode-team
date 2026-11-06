@@ -42,6 +42,60 @@ Un cambiamento dichiarato fast-track dall'utente può procedere direttamente con
 `coder`/`tester` senza il giro di approvazione. In assenza di risposta, l'`orchestratore` non
 assume il fast-track: applica il flusso ordinario oppure attende.
 
+## Leggibilità dell'output e checkpoint di sintesi
+
+L'umano che legge ha un budget di attenzione diverso da un LLM: legge una volta, non rilegge e paga
+ogni riga in tempo. Queste regole valgono per **ogni agente**, sempre, qualunque sia il task.
+
+**Policy R1–R7.**
+
+- **R1 — Prima riga = la risposta (BLUF).** Nessun preambolo: la prima frase dice cosa è successo,
+  cosa serve o cosa si decide.
+- **R2 — Budget.** ≤150 parole per una risposta conversazionale, ≤800 per un deliverable; oltre
+  serve un motivo dichiarato.
+- **R3 — Vietati:** ripetere la domanda, "Certo!", "Ottima domanda", "è importante notare che",
+  riassunto finale che ricopia.
+- **R4 — Max 4 blocchi per risposta**; una idea per paragrafo; liste per le enumerazioni; tabelle
+  solo per confronti multi-attributo.
+- **R5 — Ogni frase aggiunge informazione.** Nessun aggettivo di riempimento.
+- **R6 — Il dettaglio va in un file o in appendice**, non nel corpo.
+- **R7 — Non toccare mai numeri, identificatori, nomi di file e decisioni** per abbreviare.
+
+Le regole non si applicano a codice, JSON, log e artefatti macchina-macchina.
+
+**I due checkpoint.**
+
+- **A — requisiti.** L'`orchestratore` invoca l'`analista` quando orchestratore e utente sono
+  maturi, prima che parta l'`architetto`. L'`analista` scrive `docs/requirements/<epic>.md`;
+  l'utente approva il file o si cicla. Senza approvazione l'`architetto` non parte.
+- **B — design.** Dopo il design dell'`architetto` e il verdetto dell'`architetto-avversariale`,
+  l'utente approva `docs/design/<id>-*.md` o si cicla. Senza approvazione il `coder` non parte.
+
+**Chi scrive la sintesi.** La sintesi è una sezione del documento, non un testo a parte: la scrive
+chi scrive il documento — l'`analista` per i requisiti, l'`architetto` per il design — e la
+mette nel file **prima** che venga mostrata. L'`orchestratore` la copia letteralmente in chat: non la
+riformula e non aggiunge nulla. Se l'autore non l'ha prodotta, la scrive l'`orchestratore` e lo
+annota nella cronologia del file. Quello che l'utente legge è quindi quello che approva, e si
+verifica confrontando i due testi.
+
+**Forma della sintesi** (entrambi i checkpoint): 100-150 parole di prosa continua, niente elenchi,
+grassetti, conteggi o identificatori interni (`RF-n`, `CA-n`, `R1–R7`, `Q-n`). Dice cosa decidiamo,
+cosa costruiamo, cosa resta fuori, cosa resta aperto, e descrive il documento intero, non le
+modifiche di questa versione.
+
+**Chi fa cosa.** L'`orchestratore` raccoglie e presenta: è l'unica voce verso l'utente. L'`analista`
+formalizza i requisiti e ne scrive la sintesi; l'`architetto` scrive il design e la
+sua sintesi; l'`orchestratore` presenta copiando. `architetto`, `coder` e `tester` leggono **solo i
+file approvati**, mai la chat. Dopo l'ok dell'utente ai checkpoint l'`orchestratore` registra
+l'approvazione nel file (`stato: approvato`) e solo allora delega a valle; un file con
+`stato: bozza` non si legge come input.
+
+**Invarianti.** `chat ⊆ file`: la sintesi non contiene nulla che il file non abbia. Nessuna
+invenzione: ciò che non è tracciabile alla conversazione è marcato `[DA CONFERMARE]`. Dal ciclo 2 in
+poi si mostra solo il delta.
+
+**Chiusura.** Dopo il checkpoint B non esistono altre sintesi formali: vale solo la policy R1–R7.
+
 ## Percorsi di lavoro consentiti (obbligatorio per tutti gli agenti)
 
 Ogni agente deve usare **esclusivamente** questi percorsi per file, comandi, scratch e artefatti:
